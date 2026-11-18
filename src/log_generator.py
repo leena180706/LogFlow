@@ -33,7 +33,6 @@ LOG_TYPES = [
 # --------------------------------------------------
 
 MESSAGES = {
-
     "INFO": [
         "User logged in successfully",
         "User logout completed successfully",
@@ -109,9 +108,6 @@ MESSAGES = {
 # AUTOMATIC WORKLOAD PATTERN
 # --------------------------------------------------
 
-# These are target generation rates, not guaranteed
-# end-to-end SQS processing rates.
-
 WORKLOAD_PATTERN = [
     {"phase": "NORMAL", "rate": 20, "duration": 15},
     {"phase": "INCREASING", "rate": 80, "duration": 15},
@@ -133,11 +129,9 @@ def generate_log(workload_phase="NORMAL"):
 
     return {
         "log_id": str(uuid.uuid4()),
-
         "timestamp": datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S.%f"
         ),
-
         "server": server,
         "level": level,
         "message": message,
@@ -170,10 +164,12 @@ class AutomaticWorkloadGenerator:
 
         self.current_phase = "STOPPED"
         self.current_rate = 0
+
         self.total_generated = 0
         self.total_publish_failed = 0
 
         self.metrics_lock = threading.Lock()
+        self.start_lock = threading.Lock()
 
     # ----------------------------------------------
     # START GENERATOR
@@ -181,23 +177,25 @@ class AutomaticWorkloadGenerator:
 
     def start(self, publish_callback):
 
-        if (
-            self.generator_thread
-            and self.generator_thread.is_alive()
-        ):
-            print("Log generator is already running.")
-            return
+        with self.start_lock:
 
-        self.stop_event.clear()
+            if (
+                self.generator_thread
+                and self.generator_thread.is_alive()
+            ):
+                print("[GENERATOR] Already running.")
+                return
 
-        self.generator_thread = threading.Thread(
-            target=self._run,
-            args=(publish_callback,),
-            name="AutomaticLogGenerator",
-            daemon=True
-        )
+            self.stop_event.clear()
 
-        self.generator_thread.start()
+            self.generator_thread = threading.Thread(
+                target=self._run,
+                args=(publish_callback,),
+                name="AutomaticLogGenerator",
+                daemon=True
+            )
+
+            self.generator_thread.start()
 
         print("[GENERATOR] Automatic workload started.")
 
@@ -207,87 +205,96 @@ class AutomaticWorkloadGenerator:
 
     def _run(self, publish_callback):
 
-        while not self.stop_event.is_set():
+        try:
 
-            for stage in WORKLOAD_PATTERN:
+            while not self.stop_event.is_set():
 
-                if self.stop_event.is_set():
-                    break
+                for stage in WORKLOAD_PATTERN:
 
-                phase = stage["phase"]
-                rate = stage["rate"]
-                duration = stage["duration"]
+                    if self.stop_event.is_set():
+                        break
 
-                interval = 1.0 / rate
+                    phase = stage["phase"]
+                    rate = stage["rate"]
+                    duration = stage["duration"]
 
-                with self.metrics_lock:
-                    self.current_phase = phase
-                    self.current_rate = rate
+                    interval = 1.0 / rate
 
-                print(
-                    f"\n[WORKLOAD] {phase} | "
-                    f"Target: {rate} logs/sec | "
-                    f"Duration: {duration}s"
-                )
+                    with self.metrics_lock:
+                        self.current_phase = phase
+                        self.current_rate = rate
 
-                stage_end = time.monotonic() + duration
-                next_log_time = time.monotonic()
+                    print(
+                        f"\n[WORKLOAD] {phase} | "
+                        f"Target: {rate} logs/sec | "
+                        f"Duration: {duration}s"
+                    )
 
-                generated_in_phase = 0
+                    stage_end = time.monotonic() + duration
+                    next_log_time = time.monotonic()
 
-                while (
-                    not self.stop_event.is_set()
-                    and time.monotonic() < stage_end
-                ):
+                    generated_in_phase = 0
 
-                    now = time.monotonic()
+                    while (
+                        not self.stop_event.is_set()
+                        and time.monotonic() < stage_end
+                    ):
 
-                    if now < next_log_time:
+                        now = time.monotonic()
 
-                        self.stop_event.wait(
-                            min(next_log_time - now, 0.01)
-                        )
+                        if now < next_log_time:
 
-                        continue
+                            self.stop_event.wait(
+                                next_log_time - now
+                            )
 
-                    log = generate_log(phase)
+                            continue
 
-                    try:
+                        log = generate_log(phase)
 
-                        publish_callback(log)
+                        try:
 
-                        with self.metrics_lock:
-                            self.total_generated += 1
+                            publish_callback(log)
 
-                        generated_in_phase += 1
+                            with self.metrics_lock:
+                                self.total_generated += 1
 
-                    except Exception as error:
+                            generated_in_phase += 1
 
-                        with self.metrics_lock:
-                            self.total_publish_failed += 1
+                        except Exception as error:
 
-                        print(
-                            f"[GENERATOR ERROR] {error}"
-                        )
+                            with self.metrics_lock:
+                                self.total_publish_failed += 1
 
-                    next_log_time += interval
+                            print(
+                                f"[GENERATOR ERROR] "
+                                f"Phase: {phase} | {error}"
+                            )
 
-                    # Avoid uncontrolled catch-up bursts
-                    # if the computer falls behind.
+                        next_log_time += interval
 
-                    if next_log_time < time.monotonic() - 1:
-                        next_log_time = time.monotonic()
+                        # Prevent uncontrolled catch-up bursts.
+                        current_time = time.monotonic()
 
-                print(
-                    f"[WORKLOAD COMPLETE] {phase} | "
-                    f"Generated: {generated_in_phase}"
-                )
+                        if next_log_time < current_time:
+                            next_log_time = current_time
 
-        with self.metrics_lock:
-            self.current_phase = "STOPPED"
-            self.current_rate = 0
+                    print(
+                        f"[WORKLOAD COMPLETE] {phase} | "
+                        f"Generated: {generated_in_phase}"
+                    )
 
-        print("\n[GENERATOR] Workload stopped.")
+        except Exception as error:
+
+            print(f"[GENERATOR FATAL ERROR] {error}")
+
+        finally:
+
+            with self.metrics_lock:
+                self.current_phase = "STOPPED"
+                self.current_rate = 0
+
+            print("[GENERATOR] Workload stopped.")
 
     # ----------------------------------------------
     # STOP GENERATOR
@@ -298,7 +305,14 @@ class AutomaticWorkloadGenerator:
         self.stop_event.set()
 
         if self.generator_thread:
+
             self.generator_thread.join(timeout=10)
+
+            if self.generator_thread.is_alive():
+                print(
+                    "[GENERATOR WARNING] "
+                    "Generator thread is still stopping."
+                )
 
     # ----------------------------------------------
     # GET GENERATOR METRICS
