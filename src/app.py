@@ -1,8 +1,10 @@
 
 from flask import Flask, render_template, jsonify, request, Response
+
 import csv
 import io
 import re
+import threading
 
 from storage import (
     get_all_logs,
@@ -37,9 +39,11 @@ generator = None
 
 services_started = False
 
+services_lock = threading.Lock()
+
 
 # --------------------------------------------------
-# BACKGROUND SERVICES
+# BACKGROUND SERVICE STARTUP
 # --------------------------------------------------
 
 def start_background_services():
@@ -49,87 +53,93 @@ def start_background_services():
     global generator
     global services_started
 
-    if services_started:
-        return
+    with services_lock:
 
-    print("\n======================================")
-    print(" STARTING DISTRIBUTED LOG SYSTEM")
-    print("======================================")
+        if services_started:
+            print("[SYSTEM] Services already running.")
+            return
 
-    try:
+        print("\n======================================")
+        print(" STARTING DISTRIBUTED LOG SYSTEM")
+        print("======================================")
 
-        # ------------------------------------------
-        # 1. INITIALIZE SQS QUEUE MANAGER
-        # ------------------------------------------
+        try:
 
-        sqs_manager = SQSQueueManager()
+            # --------------------------------------
+            # 1. INITIALIZE ONE SQS MANAGER
+            # --------------------------------------
 
-        # ------------------------------------------
-        # 2. INITIALIZE DYNAMIC WORKER MANAGER
-        # ------------------------------------------
+            sqs_manager = SQSQueueManager()
 
-        worker_manager = DynamicWorkerManager(
-            min_workers=2,
-            max_workers=40,
-            messages_per_worker=8,
-            check_interval=0.75
-        )
+            # --------------------------------------
+            # 2. INITIALIZE WORKER MANAGER
+            #    USING THE SAME SQS MANAGER
+            # --------------------------------------
 
-        worker_manager.start()
+            worker_manager = DynamicWorkerManager(
+                min_workers=2,
+                max_workers=40,
+                messages_per_worker=8,
+                check_interval=0.75,
+                sqs_manager=sqs_manager
+            )
 
-        # ------------------------------------------
-        # 3. INITIALIZE AUTOMATIC LOG GENERATOR
-        # ------------------------------------------
+            worker_manager.start()
 
-        generator = AutomaticWorkloadGenerator()
+            # --------------------------------------
+            # 3. INITIALIZE AUTOMATIC GENERATOR
+            # --------------------------------------
 
-        # ------------------------------------------
-        # 4. PUBLISH GENERATED LOGS TO SQS
-        # ------------------------------------------
+            generator = AutomaticWorkloadGenerator()
 
-        def publish_log(log):
+            # --------------------------------------
+            # 4. PUBLISH GENERATED LOGS
+            # --------------------------------------
 
-            try:
-                sqs_manager.send_log(log)
+            def publish_log(log):
 
-            except Exception as error:
+                if sqs_manager is None:
+                    raise RuntimeError(
+                        "SQS manager is unavailable."
+                    )
 
-                print("[PUBLISH ERROR]", error)
+                return sqs_manager.send_log(log)
 
-                raise
+            # --------------------------------------
+            # 5. START AUTOMATIC WORKLOAD
+            # --------------------------------------
 
-        # ------------------------------------------
-        # 5. START CONTINUOUS WORKLOAD
-        # ------------------------------------------
+            generator.start(publish_log)
 
-        generator.start(publish_log)
+            services_started = True
 
-        services_started = True
+            print("\n[SYSTEM] All background services started.")
+            print("[SYSTEM] Automatic workload is running.")
+            print("[SYSTEM] Dynamic workers are monitoring SQS.")
+            print("[SYSTEM] Minimum workers: 2")
+            print("[SYSTEM] Maximum workers: 40")
 
-        print("\n[SYSTEM] All background services started.")
-        print("[SYSTEM] Automatic workload is running.")
-        print("[SYSTEM] Dynamic workers are monitoring SQS.")
-        print("[SYSTEM] Maximum workers: 40")
+        except Exception as error:
 
-    except Exception as error:
+            print("[SYSTEM START ERROR]", error)
 
-        print("[SYSTEM START ERROR]", error)
+            # Clean up partially initialized services.
+            if generator is not None:
+                generator.stop()
 
-        # Clean up partially started services.
-        if generator is not None:
-            generator.stop()
+            if worker_manager is not None:
+                worker_manager.stop()
 
-        if worker_manager is not None:
-            worker_manager.stop()
+            if sqs_manager is not None:
+                sqs_manager.stop()
 
-        if sqs_manager is not None:
-            sqs_manager.stop()
+            sqs_manager = None
+            worker_manager = None
+            generator = None
 
-        sqs_manager = None
-        worker_manager = None
-        generator = None
+            services_started = False
 
-        raise
+            raise
 
 
 # --------------------------------------------------
@@ -142,15 +152,15 @@ def stop_background_services():
 
     print("\n[SYSTEM] Stopping background services...")
 
-    # Stop new log generation first.
+    # Stop generating new messages first.
     if generator is not None:
         generator.stop()
 
-    # Flush locally buffered messages to SQS.
+    # Flush pending messages to SQS.
     if sqs_manager is not None:
         sqs_manager.stop()
 
-    # Stop the workers.
+    # Stop workers and supervisor.
     if worker_manager is not None:
         worker_manager.stop()
 
@@ -175,7 +185,7 @@ def log_to_dict(log):
 
 
 # --------------------------------------------------
-# KEYWORD SEARCH HELPERS
+# KEYWORD SEARCH ALIASES
 # --------------------------------------------------
 
 SEARCH_ALIASES = {
@@ -195,8 +205,13 @@ SEARCH_ALIASES = {
     "response": ["response time"],
     "pay": ["payment"],
     "api": ["request"]
+
 }
 
+
+# --------------------------------------------------
+# KEYWORD MATCHING
+# --------------------------------------------------
 
 def matches_keyword(log, keyword):
 
@@ -209,12 +224,18 @@ def matches_keyword(log, keyword):
         str(log[4] or "")
     ]).lower()
 
-    words = re.findall(r"[a-z0-9]+", keyword.lower())
+    words = re.findall(
+        r"[a-z0-9]+",
+        keyword.lower()
+    )
 
     for word in words:
 
         alternatives = [word]
-        alternatives.extend(SEARCH_ALIASES.get(word, []))
+
+        alternatives.extend(
+            SEARCH_ALIASES.get(word, [])
+        )
 
         if not any(
             alternative.lower() in searchable_text
@@ -301,58 +322,90 @@ def dashboard():
 
 
 # --------------------------------------------------
-# STATISTICS
+# HEALTH CHECK
 # --------------------------------------------------
 
-@app.route("/api/stats")
-def get_stats():
-
-    logs = get_all_logs()
-
-    severity_counts = {
-        "INFO": 0,
-        "WARNING": 0,
-        "ERROR": 0
-    }
-
-    server_counts = {
-        "SERVER-1": 0,
-        "SERVER-2": 0,
-        "SERVER-3": 0
-    }
-
-    for log in logs:
-
-        level = str(log[3] or "").upper()
-        server = str(log[2] or "").upper()
-
-        if level in severity_counts:
-            severity_counts[level] += 1
-
-        if server in server_counts:
-            server_counts[server] += 1
-
-    recent_errors = [
-        log_to_dict(log)
-        for log in reversed(logs)
-        if str(log[3] or "").upper() == "ERROR"
-    ][:5]
+@app.route("/health")
+def health_check():
 
     return jsonify({
 
-        "total_logs": len(logs),
+        "status": "ok",
 
-        "severity_counts": severity_counts,
+        "application": "LogFlow",
 
-        "server_counts": server_counts,
-
-        "recent_errors": recent_errors
+        "services_started": services_started
 
     })
 
 
 # --------------------------------------------------
-# LIVE SYSTEM STATUS
+# STATISTICS API
+# --------------------------------------------------
+
+@app.route("/api/stats")
+def get_stats():
+
+    try:
+
+        logs = get_all_logs()
+
+        severity_counts = {
+            "INFO": 0,
+            "WARNING": 0,
+            "ERROR": 0
+        }
+
+        server_counts = {
+            "SERVER-1": 0,
+            "SERVER-2": 0,
+            "SERVER-3": 0
+        }
+
+        for log in logs:
+
+            level = str(log[3] or "").upper()
+            server = str(log[2] or "").upper()
+
+            if level in severity_counts:
+                severity_counts[level] += 1
+
+            if server in server_counts:
+                server_counts[server] += 1
+
+        recent_errors = [
+            log_to_dict(log)
+            for log in reversed(logs)
+            if str(log[3] or "").upper() == "ERROR"
+        ][:5]
+
+        return jsonify({
+
+            "total_logs": len(logs),
+
+            "severity_counts": severity_counts,
+
+            "server_counts": server_counts,
+
+            "recent_errors": recent_errors
+
+        })
+
+    except Exception as error:
+
+        print("[STATS API ERROR]", error)
+
+        return jsonify({
+
+            "error": "Unable to retrieve statistics",
+
+            "details": str(error)
+
+        }), 500
+
+
+# --------------------------------------------------
+# LIVE SYSTEM STATUS API
 # --------------------------------------------------
 
 @app.route("/api/system")
@@ -363,10 +416,12 @@ def get_system_status():
         "running": False,
         "active_workers": 0,
         "desired_workers": 0,
+        "min_workers": 2,
         "max_workers": 40,
         "total_processed": 0,
         "total_failed": 0,
-        "workers": []
+        "workers": [],
+        "last_error": None
 
     }
 
@@ -374,7 +429,8 @@ def get_system_status():
 
         "messages_waiting": 0,
         "messages_processing": 0,
-        "messages_delayed": 0
+        "messages_delayed": 0,
+        "error": None
 
     }
 
@@ -391,7 +447,8 @@ def get_system_status():
 
         "pending_local": 0,
         "total_sent": 0,
-        "total_send_failed": 0
+        "total_send_failed": 0,
+        "total_batches": 0
 
     }
 
@@ -402,10 +459,14 @@ def get_system_status():
     if worker_manager is not None:
 
         try:
+
             worker_status = worker_manager.get_status()
 
         except Exception as error:
+
             print("[WORKER STATUS ERROR]", error)
+
+            worker_status["last_error"] = str(error)
 
     # ----------------------------------------------
     # SQS QUEUE STATUS
@@ -414,14 +475,24 @@ def get_system_status():
     if sqs_manager is not None:
 
         try:
+
             queue_status = sqs_manager.get_queue_metrics()
+
+        except Exception as error:
+
+            print("[QUEUE METRICS ERROR]", error)
+
+            queue_status["error"] = str(error)
+
+        try:
 
             publisher_status = (
                 sqs_manager.get_publisher_status()
             )
 
         except Exception as error:
-            print("[QUEUE METRICS ERROR]", error)
+
+            print("[PUBLISHER STATUS ERROR]", error)
 
     # ----------------------------------------------
     # GENERATOR STATUS
@@ -431,29 +502,10 @@ def get_system_status():
 
         try:
 
-            metrics = generator.get_metrics()
-
-            workload_status = {
-
-                "current_phase": metrics.get(
-                    "current_phase", "NORMAL"
-                ),
-
-                "current_rate": metrics.get(
-                    "current_rate", 0
-                ),
-
-                "total_generated": metrics.get(
-                    "total_generated", 0
-                ),
-
-                "total_publish_failed": metrics.get(
-                    "total_publish_failed", 0
-                )
-
-            }
+            workload_status = generator.get_metrics()
 
         except Exception as error:
+
             print("[WORKLOAD METRICS ERROR]", error)
 
     return jsonify({
@@ -472,24 +524,38 @@ def get_system_status():
 
 
 # --------------------------------------------------
-# LOG EXPLORER
+# LOG EXPLORER API
 # --------------------------------------------------
 
 @app.route("/api/logs")
 def get_logs():
 
-    logs = get_filtered_logs()
+    try:
 
-    return jsonify({
+        logs = get_filtered_logs()
 
-        "count": len(logs),
+        return jsonify({
 
-        "logs": [
-            log_to_dict(log)
-            for log in logs
-        ]
+            "count": len(logs),
 
-    })
+            "logs": [
+                log_to_dict(log)
+                for log in logs
+            ]
+
+        })
+
+    except Exception as error:
+
+        print("[LOGS API ERROR]", error)
+
+        return jsonify({
+
+            "error": "Unable to retrieve logs",
+
+            "details": str(error)
+
+        }), 500
 
 
 # --------------------------------------------------
@@ -499,15 +565,29 @@ def get_logs():
 @app.route("/api/log/<int:log_id>")
 def get_log_details(log_id):
 
-    log = get_log_by_id(log_id)
+    try:
 
-    if log is None:
+        log = get_log_by_id(log_id)
+
+        if log is None:
+
+            return jsonify({
+
+                "error": "Log not found"
+
+            }), 404
+
+        return jsonify(log_to_dict(log))
+
+    except Exception as error:
+
+        print("[LOG DETAILS ERROR]", error)
 
         return jsonify({
-            "error": "Log not found"
-        }), 404
 
-    return jsonify(log_to_dict(log))
+            "error": "Unable to retrieve log details"
+
+        }), 500
 
 
 # --------------------------------------------------
@@ -517,37 +597,49 @@ def get_log_details(log_id):
 @app.route("/api/export")
 def export_logs():
 
-    logs = get_filtered_logs()
+    try:
 
-    output = io.StringIO()
+        logs = get_filtered_logs()
 
-    writer = csv.writer(output)
+        output = io.StringIO()
 
-    writer.writerow([
-        "ID",
-        "Timestamp",
-        "Server",
-        "Severity",
-        "Message"
-    ])
+        writer = csv.writer(output)
 
-    for log in logs:
-        writer.writerow(log)
+        writer.writerow([
+            "ID",
+            "Timestamp",
+            "Server",
+            "Severity",
+            "Message"
+        ])
 
-    return Response(
+        for log in logs:
+            writer.writerow(log)
 
-        output.getvalue(),
+        return Response(
 
-        mimetype="text/csv",
+            output.getvalue(),
 
-        headers={
+            mimetype="text/csv",
 
-            "Content-Disposition":
-            "attachment; filename=Distributed_Logs.csv"
+            headers={
 
-        }
+                "Content-Disposition":
+                "attachment; filename=Distributed_Logs.csv"
 
-    )
+            }
+
+        )
+
+    except Exception as error:
+
+        print("[EXPORT ERROR]", error)
+
+        return jsonify({
+
+            "error": "Unable to export logs"
+
+        }), 500
 
 
 # --------------------------------------------------
@@ -557,18 +649,30 @@ def export_logs():
 @app.route("/api/clear", methods=["POST"])
 def clear_logs():
 
-    clear_all_logs()
+    try:
 
-    build_index()
+        clear_all_logs()
 
-    return jsonify({
+        build_index()
 
-        "message": (
-            "Stored database logs cleared. "
-            "New incoming logs will continue to be processed."
-        )
+        return jsonify({
 
-    })
+            "message": (
+                "Stored database logs cleared. "
+                "New incoming logs will continue to be processed."
+            )
+
+        })
+
+    except Exception as error:
+
+        print("[CLEAR LOGS ERROR]", error)
+
+        return jsonify({
+
+            "error": "Unable to clear logs"
+
+        }), 500
 
 
 # --------------------------------------------------
@@ -588,7 +692,7 @@ def generate_logs():
 
 
 # --------------------------------------------------
-# RUN APPLICATION
+# RUN APPLICATION LOCALLY
 # --------------------------------------------------
 
 if __name__ == "__main__":
